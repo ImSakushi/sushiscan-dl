@@ -7,54 +7,72 @@ import ansiColors from 'ansi-colors';
 
 const COOKIES_FILE_PATH = './cookies.json';
 
-function loadSavedCookies() {
+function loadSavedCookies(): Cookie[] {
   const existingCookies: Cookie[] = [];
   if (fs.existsSync(COOKIES_FILE_PATH)) {
-    existingCookies.push(
-      ...JSON.parse(
-        fs.readFileSync(COOKIES_FILE_PATH, {
-          encoding: 'utf8',
-          flag: 'r',
-        })
-      )
-    );
+    try {
+      const cookiesData = fs.readFileSync(COOKIES_FILE_PATH, 'utf8');
+      existingCookies.push(...JSON.parse(cookiesData));
+      console.log(`${ansiColors.green('✓')} ${existingCookies.length} cookies chargés depuis le cache`);
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        console.error(`${ansiColors.red('✗')} Erreur de lecture des cookies : ${error.message}`);
+      } else {
+        console.error(`${ansiColors.red('✗')} Erreur de lecture des cookies : Une erreur inconnue est survenue`);
+      }
+    }
   }
   return existingCookies;
 }
 
-function saveCookies(cookies: Cookie[]) {
-  fs.writeFileSync(COOKIES_FILE_PATH, JSON.stringify(cookies, null, '\t'), {
-    encoding: 'utf-8',
-    flag: 'w',
-  });
+function saveCookies(cookies: Cookie[]): void {
+  try {
+    fs.writeFileSync(COOKIES_FILE_PATH, JSON.stringify(cookies, null, 2), 'utf8');
+    console.log(`${ansiColors.green('✓')} ${cookies.length} cookies sauvegardés`);
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      console.error(`${ansiColors.red('✗')} Erreur de sauvegarde des cookies : ${error.message}`);
+    } else {
+      console.error(`${ansiColors.red('✗')} Erreur de sauvegarde des cookies : Une erreur inconnue est survenue`);
+    }
+  }
 }
 
-async function preloadCookies(url: string, existingCookies: Cookie[]) {
-  const browser = await firefox.launch({
-    headless: false,
-  });
+async function preloadCookies(url: string, existingCookies: Cookie[]): Promise<Cookie[]> {
+  console.log('\nValidation des cookies...');
+  const browser = await firefox.launch({ headless: false });
   const context = await browser.newContext();
   await context.addCookies(existingCookies);
+
   const page = await context.newPage();
-  await page.goto(url, {
-    waitUntil: 'domcontentloaded',
-  });
+  let attempts = 0;
 
-  let initial = false;
-  while ((await page.locator('title').innerText()) === 'Just a moment...') {
-    if (!initial) {
-      initial = true;
-      console.log('is in cloudflare!');
-      console.log('complete the captcha or close the program and manually import valid cookies in the "cookies.json" file.');
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    while ((await page.locator('title').innerText()) === 'Just a moment...' && attempts < 5) {
+      if (attempts === 0) {
+        console.log(`${ansiColors.yellow('⚠')} Cloudflare détecté :`);
+        console.log('1. Complétez le captcha manuellement');
+        console.log('2. Attendez le chargement de la page');
+        console.log('3. Le programme continuera automatiquement\n');
+      }
+
+      attempts++;
+      await page.waitForURL('https://sushiscan.net/**', { timeout: 120000 });
     }
-    await page.waitForURL('https://sushiscan.net/**', {
-      waitUntil: 'domcontentloaded',
-    });
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      console.error(`${ansiColors.red('✗')} Échec de la validation des cookies : ${error.message}`);
+    } else {
+      console.error(`${ansiColors.red('✗')} Échec de la validation des cookies : Une erreur inconnue est survenue`);
+    }
+    process.exit(1);
+  } finally {
+    const cookies = await context.cookies();
+    await browser.close();
+    return cookies;
   }
-
-  const cookies = await context.cookies();
-  await browser.close();
-  return cookies;
 }
 
 async function downloadWithRetry(
@@ -62,116 +80,168 @@ async function downloadWithRetry(
   imageUrl: string,
   folder: string,
   name: string,
-  bar1: any,
+  bar: cliProgress.SingleBar,
   destinationFolder: string
 ): Promise<void> {
+  let attempts = 0;
+  const maxLoggedAttempts = 3;
+  const startTime = Date.now();
+
   while (true) {
     try {
       const response = await context.request.get(imageUrl);
-      if (response.ok()) {
-        const body = await response.body();
-        fsExtra.outputFileSync(`${destinationFolder}/${folder}/${name}.jpg`, body);
-        bar1.increment();
-        return;
-      } else {
-        throw new Error(`HTTP status ${response.status()}`);
+      if (!response.ok()) throw new Error(`Statut HTTP ${response.status()}`);
+
+      const buffer = await response.body();
+      fsExtra.outputFileSync(`${destinationFolder}/${folder}/${name}.jpg`, buffer);
+
+      if (attempts > 0) {
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        bar.update(1, { suffix: `${ansiColors.green('✓')} ${imageUrl} (réussi après ${attempts} essais, ${duration}s)\n` });
       }
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`Failed to download ${imageUrl}: ${errorMessage}. Retrying in 10s...`);
+      return;
+    } catch (error) {
+      attempts++;
+      if (attempts <= maxLoggedAttempts) {
+        bar.update({ suffix: `${ansiColors.yellow('⚠')} [Essai ${attempts}] ${imageUrl}: ${(error as Error).message}\n` });
+      } else if (attempts === maxLoggedAttempts + 1) {
+        bar.update({ suffix: `${ansiColors.yellow('⚠')} Réessais silencieux activés pour ${imageUrl}...\n` });
+      }
       await new Promise((resolve) => setTimeout(resolve, 10000));
     }
   }
 }
 
-async function downloadingSushiscanPageImages(url: string, destinationFolder: string) {
-  console.log('preloading cookies');
-  const preloadedCookies = await preloadCookies(url, loadSavedCookies());
-  console.log('saving loaded cookies');
-  saveCookies(preloadedCookies);
+async function downloadingSushiscanPageImages(url: string, destinationFolder: string): Promise<void> {
+  console.log(ansiColors.cyan('\n=== Démarrage du téléchargement ==='));
+  console.log(`${ansiColors.cyan('URL:')} ${ansiColors.underline(url)}`);
+  console.log(`${ansiColors.cyan('Destination:')} ${ansiColors.underline(destinationFolder)}\n`);
 
+  // Gestion des cookies
+  const existingCookies = loadSavedCookies();
+  const validCookies = await preloadCookies(url, existingCookies);
+  saveCookies(validCookies);
+
+  // Configuration du navigateur
   const browser = await firefox.launch();
   const context = await browser.newContext();
-  await context.addCookies(preloadedCookies);
+  await context.addCookies(validCookies);
+
   const page = await context.newPage();
-  await page.setViewportSize({
-    width: 1920,
-    height: 1080,
-  });
+  await page.setViewportSize({ width: 1920, height: 1080 });
   await page.addInitScript(() => {
     localStorage.setItem('tsms_readingmode', '"full"');
   });
 
-  console.log('loading page... (waiting for the page to stabilize, might take up to a minute)\n');
-
-  const bar1 = new cliProgress.SingleBar(
+  // Configuration de la barre de progression
+  const progressBar = new cliProgress.SingleBar(
     {
-      barCompleteChar: ansiColors.magenta('#'),
+      format: `${ansiColors.magenta('{bar}')} {percentage}% | ETA: {eta}s | {value}/{total} | {suffix}`,
+      barCompleteChar: '#',
       barIncompleteChar: '.',
-      fps: 5,
-      stream: process.stdout,
-      barsize: 65,
+      barsize: 50,
+      hideCursor: true,
     },
     cliProgress.Presets.shades_classic
   );
 
-  const urlPassed: string[] = [];
-  const downloadPromises: Promise<void>[] = [];
-  let taille = 0;
+  let totalImages = 0;
+  const downloadQueue: Promise<void>[] = [];
+  const processedUrls = new Set<string>();
 
+  // Gestion des réponses
   page.on('response', async (response) => {
-    if (response.ok() && response.url() === (url.endsWith('/') ? url : url + '/')) {
-      const [_, images] = (await response.text()).match(/"images":\s?\[([^\]]*)\]/) as RegExpMatchArray;
-      taille = images.split(',').length;
-      bar1.start(taille, 0);
-    }
+    try {
+      // Détection du nombre d'images
+      if (response.url() === url && response.ok()) {
+        const body = await response.text();
+        const match = body.match(/"images":\s?\[([^\]]*)\]/);
+        if (!match) throw new Error('Format de réponse inattendu');
 
-    if (response.ok() && response.url().match(/wp-content\/upload.+-\d+\.\w+$/) && !urlPassed.includes(response.url())) {
-      const imageUrl = response.url();
-      urlPassed.push(imageUrl);
-      const [_, folder, name] = imageUrl.match(/\/([^/-]+)-(\d+)\.\w+$/) as RegExpMatchArray;
+        totalImages = match[1].split(',').length;
+        console.log(`${ansiColors.green('✓')} ${totalImages} images détectées`);
+        progressBar.start(totalImages, 0, { suffix: 'Initialisation...' });
+      }
 
-      downloadPromises.push(downloadWithRetry(context, imageUrl, folder, name, bar1, destinationFolder));
+      // Téléchargement des images
+      if (response.url().match(/wp-content\/upload.+-\d+\.\w+$/) && !processedUrls.has(response.url())) {
+        processedUrls.add(response.url());
+        const [_, folder, name] = response.url().match(/\/([^/-]+)-(\d+)\.\w+$/) as RegExpMatchArray;
+
+        downloadQueue.push(
+          downloadWithRetry(context, response.url(), folder, name, progressBar, destinationFolder).then(() =>
+            progressBar.increment()
+          )
+        );
+      }
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        console.error(`${ansiColors.red('✗')} Erreur de traitement : ${error.message}`);
+      } else {
+        console.error(`${ansiColors.red('✗')} Erreur de traitement : ${String(error)}`);
+      }
     }
   });
 
-  await page.goto(url, {
-    waitUntil: 'networkidle',
-    timeout: 120000,
-  });
+  // Navigation principale
+  try {
+    console.log('\nChargement de la page...');
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 120000 });
 
-  await (
-    await page.locator('#readerarea>img').all()
-  ).reduce<Promise<any>>(async (previousValue, l) => {
-    return previousValue
-      .then(() => l.evaluate((img: any) => img.scrollIntoView()))
-      .then(() => page.waitForLoadState('networkidle'));
-  }, Promise.resolve());
+    // Défilement pour charger toutes les images
+    console.log('\nChargement des images...');
+    const images = await page.locator('#readerarea>img').all();
+    for (const [index, img] of images.entries()) {
+      progressBar.update({ suffix: `Image ${index + 1}/${images.length}` });
+      await img.evaluate((element: HTMLElement) => element.scrollIntoView());
+      await page.waitForLoadState('networkidle');
+    }
 
-  await page.waitForLoadState('networkidle');
-  console.log('\nWaiting for all downloads to complete...');
-  await Promise.all(downloadPromises);
-  console.log('\nDownload complete!');
-  bar1.stop();
+    // Attente de la fin des téléchargements
+    console.log('\nFinalisation des téléchargements...');
+    await Promise.all(downloadQueue);
 
-  await browser.close();
+    console.log(`\n${ansiColors.bold.green('✓ Téléchargement terminé avec succès !')}`);
+    console.log(`${ansiColors.italic('Les images sont disponibles dans :')} ${ansiColors.underline(destinationFolder)}`);
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      console.error(`\n${ansiColors.red('✗ Erreur critique :')} ${error.message}`);
+      console.error(`${ansiColors.red('Stack trace :')}\n${error.stack}`);
+    } else {
+      console.error(`\n${ansiColors.red('✗ Erreur critique :')} ${String(error)}`);
+    }
+    process.exit(1);
+  } finally {
+    progressBar.stop();
+    await browser.close();
+  }
 }
 
-const processArgs = minimist(process.argv.slice(2));
-console.log(processArgs);
-if (processArgs['h'] || processArgs['help']) {
-  console.log('-h, --help : help');
-  console.log('-----------------');
-  console.log('<sushiscan-url> : Sushiscan url to download');
-  console.log('-d : destination folder (optional)');
-}
-const destinationFolder: string = processArgs['d'] || './dl';
-fsExtra.ensureDirSync(destinationFolder);
+// Gestion des arguments
+const args = minimist(process.argv.slice(2));
+if (args.h || args.help) {
+  console.log(`
+${ansiColors.bold('Utilisation :')}
+  npm run start -- [URL] [-d DOSSIER]
 
-const url: string = processArgs['_'][0];
-if (!url) {
-  console.log('url required, type -h to know more');
+${ansiColors.bold('Options :')}
+  -d, --dest    Dossier de destination (par défaut : ./dl)
+  -h, --help    Affiche cette aide
+  `);
+  process.exit(0);
+}
+
+// Validation des paramètres
+const destination = args.d || args.dest || './dl';
+const targetUrl = args._[0];
+
+if (!targetUrl) {
+  console.error(`${ansiColors.red('✗ URL manquante !')}`);
   process.exit(1);
 }
 
-downloadingSushiscanPageImages(url, destinationFolder);
+fsExtra.ensureDirSync(destination);
+downloadingSushiscanPageImages(targetUrl, destination).catch((error) => {
+  console.error(`${ansiColors.red('✗ Erreur non gérée :')} ${error.message}`);
+  process.exit(1);
+});
